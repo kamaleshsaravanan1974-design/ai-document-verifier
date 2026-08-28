@@ -1,1 +1,57 @@
+services:
+  # Python AI Service - Core AI processing microservice
+  - type: web
+    name: ai-document-ai-service
+    env: python
+    plan: standard
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn ai_service:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    domains:
+      - ai-service.render.com
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: LOG_LEVEL
+        value: INFO
 
+  # Node.js Backend Service - REST API and request handling
+  - type: web
+    name: ai-document-backend
+    env: node
+    plan: standard
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    domains:
+      - ai-backend.render.com
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+      - key: AI_SERVICE_URL
+        fromService:
+          name: ai-document-ai-service
+          type: web
+          property: host
+        scope: RUN_AND_BUILD
+      - key: LOG_LEVEL
+        value: INFO
+      - key: REQUEST_TIMEOUT
+        value: "30000"
+      - key: MAX_REQUEST_SIZE
+        value: "50mb"
+
+# Optional: Configure auto-deployment
+deploy:
+  branch: main
+  autodeploy: true
+
+# Optional: Health checks configuration (Render-specific)
+# Uncomment to customize health check behavior
+# healthChecks:
+#   - type: HTTP
+#     path: /health
+#     interval: 30
+#     timeout: 5
