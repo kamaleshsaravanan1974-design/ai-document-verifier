@@ -33,6 +33,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Root endpoint to prevent "Not Found" on the homepage
+@app.get("/")
+def read_root():
+    return {"message": "AI Document Verifier API is running successfully!"}
+
 # Configure CORS middleware to allow all origins
 app.add_middleware(
     CORSMiddleware,
@@ -406,3 +411,4 @@ if __name__ == "__main__":
         port=8000,
         log_level="info"
     )
+    
