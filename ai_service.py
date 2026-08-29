@@ -8,6 +8,7 @@ for passport and visa documents.
 
 import io
 import logging
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -18,6 +19,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
 import uvicorn
+
+try:
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("pytesseract not installed. OCR will use fallback mode.")
 
 # Configure logging
 logging.basicConfig(
@@ -101,79 +110,480 @@ def read_image_from_upload(file: UploadFile) -> tuple[np.ndarray, Dict[str, int]
         )
 
 
-def simulate_ocr_extraction(
+def extract_text_via_tesseract(image_array: np.ndarray) -> str:
+    """
+    Extract text from image using pytesseract.
+    
+    Args:
+        image_array: OpenCV image array
+    
+    Returns:
+        str: Extracted text from the image
+    """
+    if not PYTESSERACT_AVAILABLE:
+        logger.warning("pytesseract not available, returning empty text")
+        return ""
+    
+    try:
+        # Preprocess image for better OCR accuracy
+        # Convert to grayscale
+        gray = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
+        
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        # Apply thresholding
+        _, threshold = cv2.threshold(enhanced, 150, 255, cv2.THRESH_BINARY)
+        
+        # Extract text with pytesseract
+        extracted_text = pytesseract.image_to_string(threshold)
+        
+        logger.info(f"Successfully extracted text via OCR")
+        return extracted_text
+        
+    except Exception as e:
+        logger.error(f"Error during pytesseract OCR: {str(e)}")
+        return ""
+
+
+def parse_aadhaar_ocr(ocr_text: str) -> Dict[str, Any]:
+    """
+    Parse Aadhaar document OCR text and extract key fields.
+    
+    Args:
+        ocr_text: Raw text from pytesseract
+    
+    Returns:
+        dict: Extracted Aadhaar fields
+    """
+    extracted = {
+        "number": None,
+        "name": None,
+        "dob": None,
+        "gender": None,
+        "address": None
+    }
+    
+    lines = ocr_text.split('\n')
+    
+    # Extract Aadhaar number (12 digits)
+    aadhaar_pattern = r'\b(\d{4}\s\d{4}\s\d{4}|\d{12})\b'
+    for line in lines:
+        match = re.search(aadhaar_pattern, line)
+        if match and extracted["number"] is None:
+            number = re.sub(r'\s', '-', match.group(1))
+            if len(number.replace('-', '')) == 12:
+                extracted["number"] = f"****-****-{number[-4:]}"
+                break
+    
+    # Extract name (usually all caps on Aadhaar)
+    name_pattern = r'\b([A-Z][A-Z\s]{5,})\b'
+    for line in lines:
+        if len(line.strip()) > 5 and line.strip().isupper():
+            match = re.search(name_pattern, line.strip())
+            if match and extracted["name"] is None:
+                extracted["name"] = match.group(1).strip()
+                break
+    
+    # Extract DOB (various formats: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD)
+    dob_pattern = r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})'
+    for line in lines:
+        match = re.search(dob_pattern, line)
+        if match and extracted["dob"] is None:
+            dob_str = match.group(1)
+            # Convert to YYYY-MM-DD format
+            extracted["dob"] = normalize_date_format(dob_str)
+            break
+    
+    # Extract gender (Male/Female/M/F)
+    gender_pattern = r'\b(Male|Female|M|F)\b'
+    for line in lines:
+        match = re.search(gender_pattern, line, re.IGNORECASE)
+        if match and extracted["gender"] is None:
+            gender_text = match.group(1).upper()
+            extracted["gender"] = "Male" if gender_text.startswith('M') else "Female"
+            break
+    
+    # Extract address (usually after gender or at end)
+    address_lines = []
+    for i, line in enumerate(lines):
+        if line.strip() and extracted["gender"] and i > lines.index(extracted["gender"]):
+            address_lines.append(line.strip())
+    
+    if address_lines:
+        extracted["address"] = ", ".join(address_lines[:3])  # First 3 lines of address
+    
+    logger.info(f"Parsed Aadhaar: name={extracted['name']}, dob={extracted['dob']}, gender={extracted['gender']}")
+    return extracted
+
+
+def parse_pan_ocr(ocr_text: str) -> Dict[str, Any]:
+    """
+    Parse PAN document OCR text and extract key fields.
+    
+    Args:
+        ocr_text: Raw text from pytesseract
+    
+    Returns:
+        dict: Extracted PAN fields
+    """
+    extracted = {
+        "number": None,
+        "name": None,
+        "father_name": None,
+        "dob": None
+    }
+    
+    lines = ocr_text.split('\n')
+    
+    # Extract PAN number (format: AAAAA9999A)
+    pan_pattern = r'\b([A-Z]{5}[0-9]{4}[A-Z])\b'
+    for line in lines:
+        match = re.search(pan_pattern, line)
+        if match and extracted["number"] is None:
+            extracted["number"] = match.group(1)
+            break
+    
+    # Extract name (typically in uppercase)
+    for line in lines:
+        line_clean = line.strip()
+        if len(line_clean) > 5 and line_clean.isupper() and extracted["name"] is None:
+            # Avoid matching document type indicators
+            if "PAN" not in line_clean and "INDIA" not in line_clean:
+                extracted["name"] = line_clean
+                break
+    
+    # Extract father's name
+    father_pattern = r'(?:Father|Father\'s|FATHER)[\s:]*([A-Z\s]+)'
+    for line in lines:
+        match = re.search(father_pattern, line, re.IGNORECASE)
+        if match and extracted["father_name"] is None:
+            extracted["father_name"] = match.group(1).strip()
+            break
+    
+    # Extract DOB
+    dob_pattern = r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})'
+    for line in lines:
+        match = re.search(dob_pattern, line)
+        if match and extracted["dob"] is None:
+            extracted["dob"] = normalize_date_format(match.group(1))
+            break
+    
+    logger.info(f"Parsed PAN: name={extracted['name']}, pan={extracted['number']}")
+    return extracted
+
+
+def parse_license_ocr(ocr_text: str) -> Dict[str, Any]:
+    """
+    Parse Driving License document OCR text and extract key fields.
+    
+    Args:
+        ocr_text: Raw text from pytesseract
+    
+    Returns:
+        dict: Extracted License fields
+    """
+    extracted = {
+        "number": None,
+        "name": None,
+        "dob": None,
+        "issue_date": None,
+        "expiry_date": None,
+        "validity": None
+    }
+    
+    lines = ocr_text.split('\n')
+    
+    # Extract license number (DL + state code + year + number)
+    license_pattern = r'\b(DL[0-9]{2}[0-9]{4}[0-9]{6,8})\b'
+    for line in lines:
+        match = re.search(license_pattern, line, re.IGNORECASE)
+        if match and extracted["number"] is None:
+            extracted["number"] = match.group(1).upper()
+            break
+    
+    # Extract name (typically uppercase)
+    for line in lines:
+        line_clean = line.strip()
+        if len(line_clean) > 5 and line_clean.isupper() and extracted["name"] is None:
+            if "DL" not in line_clean and "LICENSE" not in line_clean:
+                extracted["name"] = line_clean
+                break
+    
+    # Extract DOB
+    dob_pattern = r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})'
+    dates_found = []
+    for line in lines:
+        matches = re.findall(dob_pattern, line)
+        dates_found.extend(matches)
+    
+    if dates_found and extracted["dob"] is None:
+        extracted["dob"] = normalize_date_format(dates_found[0])
+    
+    # Extract issue and expiry dates (if multiple dates found)
+    if len(dates_found) >= 2 and extracted["issue_date"] is None:
+        extracted["issue_date"] = normalize_date_format(dates_found[0])
+        extracted["expiry_date"] = normalize_date_format(dates_found[1])
+    
+    # Determine validity
+    if extracted["expiry_date"]:
+        expiry = datetime.strptime(extracted["expiry_date"], "%Y-%m-%d")
+        extracted["validity"] = "Valid" if expiry > datetime.now() else "Expired"
+    
+    logger.info(f"Parsed License: name={extracted['name']}, number={extracted['number']}")
+    return extracted
+
+
+def parse_passport_ocr(ocr_text: str) -> Dict[str, Any]:
+    """
+    Parse Passport document OCR text and extract key fields.
+    
+    Args:
+        ocr_text: Raw text from pytesseract
+    
+    Returns:
+        dict: Extracted Passport fields
+    """
+    extracted = {
+        "number": None,
+        "name": None,
+        "dob": None,
+        "gender": None,
+        "passport_type": None,
+        "issue_date": None,
+        "expiry_date": None
+    }
+    
+    lines = ocr_text.split('\n')
+    
+    # Extract passport number (format: A12345678)
+    passport_pattern = r'\b([A-Z]\d{7})\b'
+    for line in lines:
+        match = re.search(passport_pattern, line)
+        if match and extracted["number"] is None:
+            extracted["number"] = match.group(1)
+            break
+    
+    # Extract name (typically uppercase)
+    for line in lines:
+        line_clean = line.strip()
+        if len(line_clean) > 5 and line_clean.isupper() and extracted["name"] is None:
+            if "PASSPORT" not in line_clean:
+                extracted["name"] = line_clean
+                break
+    
+    # Extract gender
+    gender_pattern = r'\b(Male|Female|M|F)\b'
+    for line in lines:
+        match = re.search(gender_pattern, line, re.IGNORECASE)
+        if match and extracted["gender"] is None:
+            gender_text = match.group(1).upper()
+            extracted["gender"] = "Male" if gender_text.startswith('M') else "Female"
+            break
+    
+    # Extract DOB and dates
+    dob_pattern = r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})'
+    dates_found = []
+    for line in lines:
+        matches = re.findall(dob_pattern, line)
+        dates_found.extend(matches)
+    
+    if dates_found:
+        extracted["dob"] = normalize_date_format(dates_found[0])
+        if len(dates_found) >= 2:
+            extracted["issue_date"] = normalize_date_format(dates_found[0])
+            extracted["expiry_date"] = normalize_date_format(dates_found[1])
+    
+    # Extract passport type
+    type_pattern = r'\b(Regular|Official|Diplomatic)\b'
+    for line in lines:
+        match = re.search(type_pattern, line, re.IGNORECASE)
+        if match and extracted["passport_type"] is None:
+            extracted["passport_type"] = match.group(1)
+            break
+    
+    logger.info(f"Parsed Passport: name={extracted['name']}, number={extracted['number']}")
+    return extracted
+
+
+def parse_visa_ocr(ocr_text: str) -> Dict[str, Any]:
+    """
+    Parse Visa document OCR text and extract key fields.
+    
+    Args:
+        ocr_text: Raw text from pytesseract
+    
+    Returns:
+        dict: Extracted Visa fields
+    """
+    extracted = {
+        "visa_number": None,
+        "name": None,
+        "passport_number": None,
+        "issue_date": None,
+        "expiry_date": None,
+        "visa_type": None,
+        "country": None
+    }
+    
+    lines = ocr_text.split('\n')
+    
+    # Extract visa number (usually alphanumeric)
+    visa_pattern = r'\b(V\d{8,10})\b'
+    for line in lines:
+        match = re.search(visa_pattern, line, re.IGNORECASE)
+        if match and extracted["visa_number"] is None:
+            extracted["visa_number"] = match.group(1)
+            break
+    
+    # Extract name
+    for line in lines:
+        line_clean = line.strip()
+        if len(line_clean) > 5 and line_clean.isupper() and extracted["name"] is None:
+            if "VISA" not in line_clean:
+                extracted["name"] = line_clean
+                break
+    
+    # Extract passport number
+    passport_pattern = r'\b([A-Z]\d{7})\b'
+    for line in lines:
+        match = re.search(passport_pattern, line)
+        if match and extracted["passport_number"] is None:
+            extracted["passport_number"] = match.group(1)
+            break
+    
+    # Extract dates
+    dob_pattern = r'(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})'
+    dates_found = []
+    for line in lines:
+        matches = re.findall(dob_pattern, line)
+        dates_found.extend(matches)
+    
+    if len(dates_found) >= 2:
+        extracted["issue_date"] = normalize_date_format(dates_found[0])
+        extracted["expiry_date"] = normalize_date_format(dates_found[1])
+    
+    # Extract visa type
+    type_pattern = r'\b(Tourist|Business|Student|Work|Transit)\b'
+    for line in lines:
+        match = re.search(type_pattern, line, re.IGNORECASE)
+        if match and extracted["visa_type"] is None:
+            extracted["visa_type"] = match.group(1)
+            break
+    
+    # Extract country
+    country_pattern = r'\b(USA|UK|Canada|Australia|Germany|France|India)\b'
+    for line in lines:
+        match = re.search(country_pattern, line, re.IGNORECASE)
+        if match and extracted["country"] is None:
+            extracted["country"] = match.group(1)
+            break
+    
+    logger.info(f"Parsed Visa: name={extracted['name']}, visa_number={extracted['visa_number']}")
+    return extracted
+
+
+def normalize_date_format(date_str: str) -> Optional[str]:
+    """
+    Convert date strings to YYYY-MM-DD format.
+    
+    Args:
+        date_str: Date string in various formats (DD/MM/YYYY, MM-DD-YYYY, etc.)
+    
+    Returns:
+        str: Date in YYYY-MM-DD format, or None if parsing fails
+    """
+    if not date_str:
+        return None
+    
+    # Remove any spaces
+    date_str = date_str.strip()
+    
+    # List of common date formats to try
+    formats = [
+        r'^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$',  # DD/MM/YYYY or MM/DD/YYYY
+        r'^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$',  # YYYY/MM/DD
+    ]
+    
+    for pattern in formats:
+        match = re.match(pattern, date_str)
+        if match:
+            parts = match.groups()
+            
+            # Try to determine if first part is day or year
+            if int(parts[0]) > 31:  # Must be year
+                year, month, day = parts
+            elif int(parts[2]) > 31:  # Must be year
+                day, month, year = parts
+            else:
+                # Ambiguous, assume DD/MM/YYYY (common in India)
+                day, month, year = parts
+            
+            try:
+                # Validate and return
+                date_obj = datetime(int(year), int(month), int(day))
+                return date_obj.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    
+    return None
+
+
+def perform_ocr_extraction(
     document_type: str,
+    image_array: np.ndarray,
     image_metrics: Dict[str, int]
 ) -> Dict[str, Any]:
     """
-    Simulate OCR extraction for a document.
+    Perform actual OCR extraction using pytesseract with regex-based parsing.
     
     Args:
         document_type: Type of document (aadhaar, pan, etc.)
+        image_array: OpenCV image array
         image_metrics: Dict containing image width and height
     
     Returns:
-        dict: Simulated OCR results with extracted fields
+        dict: OCR results with extracted fields
     """
-    # Simulate document-specific OCR results
-    ocr_results = {
-        "aadhaar": {
-            "number": "****-****-1234",
-            "name": "John Doe",
-            "dob": "1990-05-15",
-            "gender": "Male",
-            "address": "123 Main Street, City, State"
-        },
-        "pan": {
-            "number": "ABCDE1234F",
-            "name": "John Doe",
-            "father_name": "James Doe",
-            "dob": "1990-05-15"
-        },
-        "license": {
-            "number": "DL0020170012345",
-            "name": "John Doe",
-            "dob": "1990-05-15",
-            "issue_date": "2017-05-20",
-            "expiry_date": "2027-05-19",
-            "validity": "Valid"
-        },
-        "passport": {
-            "number": "N12345678",
-            "name": "John Doe",
-            "dob": "1990-05-15",
-            "gender": "Male",
-            "passport_type": "Regular",
-            "issue_date": "2015-10-20",
-            "expiry_date": "2025-10-19"
-        },
-        "visa": {
-            "visa_number": "V123456789",
-            "name": "John Doe",
-            "passport_number": "N12345678",
-            "issue_date": "2023-01-15",
-            "expiry_date": "2026-01-14",
-            "visa_type": "Tourist",
-            "country": "USA"
-        }
+    # Extract text from image
+    ocr_text = extract_text_via_tesseract(image_array)
+    
+    # Parse based on document type
+    parse_functions = {
+        "aadhaar": parse_aadhaar_ocr,
+        "pan": parse_pan_ocr,
+        "license": parse_license_ocr,
+        "passport": parse_passport_ocr,
+        "visa": parse_visa_ocr
     }
     
-    # Calculate confidence based on image quality (simulated)
-    # Better resolution images get higher confidence
+    parser = parse_functions.get(document_type, lambda x: {})
+    extracted_data = parser(ocr_text)
+    
+    # Calculate confidence based on extracted data completeness and image quality
+    data_completeness = sum(1 for v in extracted_data.values() if v is not None) / len(extracted_data)
+    
+    # Image quality based on resolution
     image_area = image_metrics["width"] * image_metrics["height"]
     if image_area >= 1920 * 1440:  # 4K or higher
-        ocr_confidence = 0.98
+        image_quality_score = 0.98
     elif image_area >= 1280 * 720:  # HD or higher
-        ocr_confidence = 0.92
+        image_quality_score = 0.92
     elif image_area >= 640 * 480:  # VGA or higher
-        ocr_confidence = 0.85
+        image_quality_score = 0.85
     else:
-        ocr_confidence = 0.72
+        image_quality_score = 0.72
+    
+    # Combine scores
+    ocr_confidence = min(data_completeness * image_quality_score, 0.99)
     
     return {
-        "ocr_text": ocr_results.get(document_type, {}),
+        "ocr_text": extracted_data,
+        "raw_ocr_output": ocr_text[:500],  # Include first 500 chars of raw output for debugging
         "ocr_confidence": ocr_confidence,
-        "text_quality": "Good" if ocr_confidence >= 0.90 else "Acceptable"
+        "text_quality": "Good" if ocr_confidence >= 0.90 else "Acceptable" if ocr_confidence >= 0.75 else "Poor",
+        "data_completeness": round(data_completeness, 2)
     }
 
 
@@ -288,7 +698,8 @@ async def health_check() -> JSONResponse:
         "status": "running",
         "service": "AI Document Verification Service",
         "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "ocr_available": PYTESSERACT_AVAILABLE
     })
 
 
@@ -333,8 +744,8 @@ async def verify_document(
         # Read and process document image
         doc_image, doc_metrics = read_image_from_upload(documentImage)
         
-        # Perform OCR extraction
-        ocr_result = simulate_ocr_extraction(documentType.lower(), doc_metrics)
+        # Perform OCR extraction with actual pytesseract parsing
+        ocr_result = perform_ocr_extraction(documentType.lower(), doc_image, doc_metrics)
         
         # Perform authenticity check
         authenticity_result = simulate_authenticity_check(
@@ -352,7 +763,9 @@ async def verify_document(
             "ocr_extraction": {
                 "extracted_data": ocr_result["ocr_text"],
                 "confidence_score": round(ocr_result["ocr_confidence"], 4),
-                "text_quality": ocr_result["text_quality"]
+                "text_quality": ocr_result["text_quality"],
+                "data_completeness": ocr_result["data_completeness"],
+                "raw_output_sample": ocr_result["raw_ocr_output"]
             },
             "authenticity_analysis": {
                 "confidence_score": authenticity_result["authenticity_confidence"],
@@ -411,4 +824,3 @@ if __name__ == "__main__":
         port=8000,
         log_level="info"
     )
-    
